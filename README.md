@@ -9,6 +9,7 @@ tracker_sync/
 ├── .gitignore            # Настройки Git
 └── app/                  # Исходный код
     ├── config.py         # Конфигурация (.env)
+    ├── logger.py         # Логирование 
     ├── webhook_server.py # Flask webhook-сервер
     ├── tracker_client.py # Клиент Яндекс Трекер API v3
     ├── sync_all.py       # Массовое обновление
