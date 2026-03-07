@@ -61,14 +61,11 @@ def get_issue_tags(issue_key: str) -> list[str]:
 
 def get_subtasks(parent_key: str) -> list[str]:
     """
-    Получить ключи всех прямых подзадач через API связей.
     GET /v3/issues/{parent_key}/links
 
     Фильтр:
-      type.id == "subtask" AND direction == "inward"
-      → связанная задача является подзадачей parent_key.
-
-    Работает для задачи ЛЮБОГО типа: Эпик, История, Задача, Баг и т.д.
+      type.id == "subtask" AND direction == "outward"
+      → object является подзадачей parent_key
     """
     links = _request("GET", f"/issues/{parent_key}/links")
 
@@ -77,7 +74,7 @@ def get_subtasks(parent_key: str) -> list[str]:
         for link in links
         if (
             link.get("type", {}).get("id") == "subtask"
-            and link.get("direction") == "inward"
+            and link.get("direction") == "outward"   # ← БЫЛО "inward"
             and link.get("object", {}).get("key")
         )
     ]
@@ -85,6 +82,7 @@ def get_subtasks(parent_key: str) -> list[str]:
     logger.info("Задача %s → найдено подзадач: %d %s",
                 parent_key, len(subtask_keys), subtask_keys)
     return subtask_keys
+
 
 
 # ──────────────────────────────────────────────────────────────
