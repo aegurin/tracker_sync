@@ -1,8 +1,13 @@
-*
+!app/
+
+app/**/
 app/*/
+
 !app/*.py
-!app/*.env
+!app/*.txt
+!app/*.ini
+!app/*.md
 !app/*.env.example
+
 !.gitignore
-!.git
 !README.md
