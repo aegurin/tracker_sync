@@ -124,7 +124,7 @@ def get_subtasks(parent_key: str) -> list[str]:
         for link in links
         if (
             link.get("type", {}).get("id") == "subtask"
-            and link.get("direction") == "inward"
+            and link.get("direction") == "outward"
             and link.get("object", {}).get("key")
         )
     ]
