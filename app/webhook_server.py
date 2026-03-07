@@ -1,44 +1,92 @@
 """
 Webhook-сервер для обработки HTTP-запросов от триггеров Яндекс Трекера.
 
-Синхронизирует теги задачи ЛЮБОГО типа со всеми её прямыми подзадачами
-через Bulk Change API одним запросом.
+Поддерживаемые эндпоинты:
+  GET  /health                     — проверка работоспособности
+  POST /webhook/tags-sync          — синхронизация тегов
+  POST /webhook/priority-sync      — синхронизация businessPriority
+  POST /webhook/full-sync          — синхронизация тегов + businessPriority
 
-Триггер настраивается вручную в UI Трекера:
-  Настройки очереди → Автоматизация → Триггеры → Создать триггер
-  Условие:  Теги → «Значение поля изменилось»
-  Действие: HTTP POST → {WEBHOOK_URL}/webhook/tags-sync
-  Тело:     {"issue_key": "{{issue.key}}"}
-
-Яндекс Трекер ожидает ответ за 10 сек.
-При HTTP 500 или таймауте повторяет запрос до 5 раз.
+Настройка триггеров в UI Трекера:
+  Условие: «Значение поля изменилось» для нужного поля
+  Тело:    {"issue_key": "{{issue.key}}"}
 """
-import logging
-import sys
+import time
 
 from flask import Flask, request, jsonify, abort
 
 import config
-from tracker_client import sync_tags_to_subtasks, TrackerAPIError
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+from logger import get_logger
+from tracker_client import (
+    sync_tags_to_subtasks,
+    sync_business_priority_to_subtasks,
+    sync_all_fields_to_subtasks,
+    TrackerAPIError,
 )
-logger = logging.getLogger(__name__)
 
+logger = get_logger(__name__)
 app = Flask(__name__)
 
 
 def _check_secret() -> bool:
-    """
-    Проверить заголовок X-Tracker-Secret, если WEBHOOK_SECRET задан.
-    Значение задаётся в заголовках действия триггера в Яндекс Трекере.
-    """
+    """Проверить X-Tracker-Secret если WEBHOOK_SECRET задан."""
     if not config.WEBHOOK_SECRET:
         return True
     return request.headers.get("X-Tracker-Secret") == config.WEBHOOK_SECRET
+
+
+def _get_issue_key() -> str:
+    """
+    Извлечь issue_key из тела запроса.
+    Вызывает abort(400/403) при ошибке валидации.
+    """
+    if not _check_secret():
+        logger.warning("Неверный секрет от %s", request.remote_addr)
+        abort(403, description="Invalid secret")
+
+    data = request.get_json(silent=True)
+    if not data:
+        logger.warning("Пустое тело запроса от %s", request.remote_addr)
+        abort(400, description="Пустое тело или не JSON")
+
+    issue_key = data.get("issue_key")
+    if not issue_key:
+        logger.warning("Отсутствует issue_key: %s", data)
+        abort(400, description="Поле \'issue_key\' отсутствует")
+
+    return issue_key
+
+
+def _handle(sync_fn, issue_key: str) -> tuple:
+    """
+    Общий обработчик вызова sync-функции с логированием времени.
+
+    HTTP коды ответов:
+        200 — успех
+        400 — плохой запрос     (Трекер НЕ повторяет)
+        403 — неверный секрет   (Трекер НЕ повторяет)
+        500 — внутренняя ошибка (Трекер повторит до 5 раз)
+        502 — ошибка Трекер API (Трекер НЕ повторяет)
+    """
+    start = time.monotonic()
+    logger.info("Webhook: %s → %s", sync_fn.__name__, issue_key)
+    try:
+        result = sync_fn(issue_key)
+        elapsed = round(time.monotonic() - start, 3)
+        logger.info(
+            "Готово: issue=%s status=%s subtasks=%d elapsed=%.3fs",
+            issue_key,
+            result.get("status"),
+            len(result.get("subtasks", [])),
+            elapsed,
+        )
+        return jsonify(result), 200
+    except TrackerAPIError as exc:
+        logger.error("Ошибка Трекер API [%s]: %s", issue_key, exc)
+        return jsonify({"error": str(exc)}), 502
+    except Exception:
+        logger.exception("Неожиданная ошибка [%s]", issue_key)
+        return jsonify({"error": "Internal server error"}), 500
 
 
 # ──────────────────────────────────────────────────────────────
@@ -54,44 +102,36 @@ def health():
 @app.post("/webhook/tags-sync")
 def webhook_tags_sync():
     """
-    Обработчик webhook от триггера Яндекс Трекера.
+    Синхронизировать теги родительской задачи → подзадачи.
 
-    Ожидаемое тело (шаблон в настройках триггера):
-        {"issue_key": "{{issue.key}}"}
-
-    Коды ответов:
-        200 — успех
-        400 — плохой запрос     (Трекер НЕ повторяет)
-        403 — неверный секрет   (Трекер НЕ повторяет)
-        500 — внутренняя ошибка (Трекер повторит до 5 раз)
-        502 — ошибка Трекер API (Трекер НЕ повторяет)
+    Триггер: Теги → «Значение поля изменилось»
     """
-    if not _check_secret():
-        logger.warning("Неверный секрет от %s", request.remote_addr)
-        abort(403, description="Invalid secret")
+    return _handle(sync_tags_to_subtasks, _get_issue_key())
 
-    data = request.get_json(silent=True)
-    if not data:
-        abort(400, description="Пустое тело или не JSON")
 
-    issue_key = data.get("issue_key")
-    if not issue_key:
-        abort(400, description="Поле \'issue_key\' отсутствует")
+@app.post("/webhook/priority-sync")
+def webhook_priority_sync():
+    """
+    Синхронизировать businessPriority родительской задачи → подзадачи.
 
-    logger.info("Получен webhook: issue_key=%s", issue_key)
+    Триггер: businessPriority → «Значение поля изменилось»
+    """
+    return _handle(sync_business_priority_to_subtasks, _get_issue_key())
 
-    try:
-        result = sync_tags_to_subtasks(issue_key)
-        return jsonify(result), 200
 
-    except TrackerAPIError as exc:
-        logger.error("Ошибка Трекер API: %s", exc)
-        return jsonify({"error": str(exc)}), 502
+@app.post("/webhook/full-sync")
+def webhook_full_sync():
+    """
+    Синхронизировать теги И businessPriority одним запросом → подзадачи.
 
-    except Exception as exc:
-        logger.exception("Неожиданная ошибка: %s", exc)
-        return jsonify({"error": "Internal server error"}), 500
+    Триггер: Теги ИЛИ businessPriority → «Значение поля изменилось»
+    """
+    return _handle(sync_all_fields_to_subtasks, _get_issue_key())
 
+
+# ──────────────────────────────────────────────────────────────
+# Обработчики ошибок
+# ──────────────────────────────────────────────────────────────
 
 @app.errorhandler(400)
 def bad_request(e):
