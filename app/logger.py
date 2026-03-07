@@ -27,11 +27,16 @@ import config
 # ──────────────────────────────────────────────────────────────
 # Настройки из .env
 # ──────────────────────────────────────────────────────────────
-LOG_LEVEL       = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE        = os.getenv("LOG_FILE", "logs/app.log")
-LOG_MAX_BYTES   = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 МБ
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# АБСОЛЮТНЫЙ путь к логам проекта
+BASE_DIR = Path(__file__).parent.parent.resolve()  # ~/tracker_sync
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = str(LOG_DIR / "app.log")  # ~/tracker_sync/logs/app.log
+
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))
-LOG_JSON        = os.getenv("LOG_JSON", "false").lower() == "true"
+LOG_JSON = os.getenv("LOG_JSON", "false").lower() == "true"
 
 
 # ──────────────────────────────────────────────────────────────
