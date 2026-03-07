@@ -2,11 +2,13 @@
 Клиент Яндекс Трекер API v3.
 
 Поддерживает наследование от задачи ЛЮБОГО типа к подзадачам:
-  - тегов (tags)
-  - пользовательского поля businessPriority
-  - любой комбинации полей через sync_fields_to_subtasks()
+  - тегов (tags)              — системное поле
+  - businessPriority          — локальное пользовательское поле (тип integer)
 
-Bulk Change API: один запрос на все подзадачи (до 10 000).
+Локальные поля в Яндекс Трекере хранятся в ответе API под полным ID вида:
+  "<queue_id>--<key>"  (например: "66af837b466cdf786c0e0ee6--businessPriority")
+
+При записи через Bulk Change API тоже нужно использовать полный ID.
 """
 import time
 
@@ -19,6 +21,26 @@ logger = get_logger(__name__)
 
 BULKCHANGE_POLL_INTERVAL = 2   # сек между запросами статуса
 BULKCHANGE_POLL_TIMEOUT  = 60  # максимальное время ожидания, сек
+
+# ──────────────────────────────────────────────────────────────
+# Маппинг локальных полей: короткий ключ → полный ID в API
+# Полный ID берётся из атрибута "id" поля в ответе API.
+# ──────────────────────────────────────────────────────────────
+LOCAL_FIELDS: dict[str, str] = {
+    "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
+}
+
+
+def _api_field_key(field_key: str) -> str:
+    """
+    Вернуть ключ поля для использования в API-запросах.
+    Локальные поля подменяются на полный ID.
+
+    Пример:
+        "tags"             → "tags"
+        "businessPriority" → "66af837b466cdf786c0e0ee6--businessPriority"
+    """
+    return LOCAL_FIELDS.get(field_key, field_key)
 
 
 class TrackerAPIError(Exception):
@@ -55,7 +77,7 @@ def _request(method: str, path: str, **kwargs) -> dict | list:
 
 def get_issue(issue_key: str) -> dict:
     """
-    Получить все данные задачи.
+    Получить все данные задачи включая локальные поля.
     GET /v3/issues/{issue_key}
     """
     return _request("GET", f"/issues/{issue_key}")
@@ -70,21 +92,21 @@ def get_issue_tags(issue_key: str) -> list[str]:
 
 def get_issue_field(issue_key: str, field_key: str):
     """
-    Получить значение произвольного поля задачи по ключу.
+    Получить значение поля задачи по короткому ключу.
 
-    Работает как для системных полей (tags, priority),
-    так и для пользовательских (businessPriority и др.).
+    Автоматически подменяет короткий ключ на полный ID для локальных полей.
 
     Args:
         issue_key: ключ задачи (например PROJ-1)
-        field_key: ключ поля   (например businessPriority)
+        field_key: короткий ключ поля (например businessPriority)
 
     Returns:
         значение поля или None если поле отсутствует
     """
     issue = get_issue(issue_key)
-    value = issue.get(field_key)
-    logger.debug("Поле [%s].%s = %s", issue_key, field_key, value)
+    api_key = _api_field_key(field_key)
+    value = issue.get(api_key)
+    logger.debug("Поле [%s].%s (api_key=%s) = %s", issue_key, field_key, api_key, value)
     return value
 
 
@@ -92,19 +114,35 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     """
     Получить значения нескольких полей задачи за один запрос.
 
+    Для локальных полей автоматически использует полный ID в API-ответе,
+    но возвращает результат под коротким ключом.
+
     Args:
         issue_key:  ключ задачи
-        field_keys: список ключей полей
+        field_keys: список коротких ключей полей
 
     Returns:
-        словарь {field_key: value}, значение None для отсутствующих полей
+        {short_key: value} — всегда под коротким ключом
 
     Пример:
         get_issue_fields("PROJ-1", ["tags", "businessPriority"])
-        → {"tags": ["backend"], "businessPriority": {"id": "high", "display": "Высокий"}}
+        → {"tags": ["backend"], "businessPriority": 3}
     """
     issue = get_issue(issue_key)
-    result = {key: issue.get(key) for key in field_keys}
+
+    result = {}
+    for key in field_keys:
+        api_key = _api_field_key(key)
+        value = issue.get(api_key)
+        result[key] = value
+        if value is None:
+            logger.warning(
+                "Поле '%s' (api_key='%s') не найдено в задаче %s. "
+                "Доступные ключи: %s",
+                key, api_key, issue_key,
+                [k for k in issue.keys() if key.lower() in k.lower()] or "не найдено",
+            )
+
     logger.debug("Поля [%s]: %s", issue_key, result)
     return result
 
@@ -115,7 +153,7 @@ def get_subtasks(parent_key: str) -> list[str]:
     GET /v3/issues/{parent_key}/links
 
     Фильтр: type.id == "subtask" AND direction == "outward"
-    Работает для задач ЛЮБОГО типа: Эпик, История, Задача, Баг и т.д.
+    Работает для задач ЛЮБОГО типа.
     """
     links = _request("GET", f"/issues/{parent_key}/links")
 
@@ -146,28 +184,33 @@ def bulk_update_fields(
     Массово обновить произвольные поля задач одним запросом.
     POST /v3/bulkchange/_update
 
-    Операция асинхронная — возвращает объект задания (id, status).
-    Максимум 10 000 задач за один запрос.
+    Локальные поля автоматически подменяются на полный ID
+    перед отправкой в API.
 
     Args:
-        issue_keys: ключи задач для обновления
-        fields:     словарь полей для изменения
+        issue_keys: ключи задач для обновления (до 10 000)
+        fields:     {short_key: value}
                     Примеры:
                       {"tags": ["backend", "sprint-10"]}
-                      {"businessPriority": {"id": "high"}}
-                      {"tags": [...], "businessPriority": {...}}
-        notify:     уведомлять исполнителей об изменении
+                      {"businessPriority": 3}
+                      {"tags": [...], "businessPriority": 3}
+        notify:     уведомлять исполнителей
 
     Returns:
         объект bulkchange с полями id, status
     """
+    # Подменяем короткие ключи на полные API-ключи для локальных полей
+    api_fields = {_api_field_key(k): v for k, v in fields.items()}
+
     logger.info(
         "Bulk update: %d задач → поля %s",
         len(issue_keys), list(fields.keys()),
     )
+    logger.debug("API payload values: %s", api_fields)
+
     return _request("POST", "/bulkchange/_update", json={
         "issues": issue_keys,
-        "values": fields,
+        "values": api_fields,
         "notify": notify,
     })
 
@@ -177,16 +220,13 @@ def bulk_update_tags(
     tags: list[str],
     notify: bool = False,
 ) -> dict:
-    """
-    Массово обновить теги задач.
-    Обёртка над bulk_update_fields для обратной совместимости.
-    """
+    """Массово обновить теги. Обёртка над bulk_update_fields."""
     return bulk_update_fields(issue_keys, {"tags": tags}, notify)
 
 
 def get_bulkchange_status(bulkchange_id: str) -> dict:
     """
-    Получить статус задания группового изменения.
+    Получить статус задания.
     GET /v3/bulkchange/{bulkchange_id}
 
     Статусы: CREATED → RUNNING → DONE | FAILED
@@ -237,18 +277,18 @@ def sync_fields_to_subtasks(
     Универсальная синхронизация произвольных полей родительской задачи
     во все её прямые подзадачи через Bulk Change API.
 
-    Работает для задачи ЛЮБОГО типа.
+    Работает для задачи ЛЮБОГО типа и любых полей (системных и локальных).
 
     Args:
         parent_key:  ключ родительской задачи
-        field_keys:  список ключей полей для синхронизации
+        field_keys:  список коротких ключей полей
                      Примеры: ["tags"], ["businessPriority"], ["tags", "businessPriority"]
         notify:      уведомлять исполнителей
 
     Returns:
         {
           "parent":        str,
-          "fields":        dict,   # {field_key: value} актуальные значения
+          "fields":        dict,   # {short_key: value}
           "subtasks":      list[str],
           "bulkchange_id": str | None,
           "status":        str,    # DONE | FAILED | SKIPPED
@@ -257,11 +297,10 @@ def sync_fields_to_subtasks(
     """
     logger.info("▶ Синхронизация полей %s: %s", field_keys, parent_key)
 
-    # Читаем все нужные поля за один запрос
     parent_fields = get_issue_fields(parent_key, field_keys)
     logger.info("Значения полей [%s]: %s", parent_key, parent_fields)
 
-    # Фильтруем поля с None — не передаём пустые значения
+    # Фильтруем None — не обновляем незаполненные поля
     fields_to_sync = {k: v for k, v in parent_fields.items() if v is not None}
     if not fields_to_sync:
         logger.warning(
@@ -317,13 +356,7 @@ def sync_fields_to_subtasks(
 
 
 def sync_tags_to_subtasks(parent_key: str) -> dict:
-    """
-    Скопировать теги родительской задачи во все подзадачи.
-    Обёртка над sync_fields_to_subtasks для обратной совместимости.
-
-    Returns:
-        {parent, tags, subtasks, bulkchange_id, status[, error]}
-    """
+    """Синхронизировать теги → подзадачи."""
     result = sync_fields_to_subtasks(parent_key, ["tags"])
     return {
         "parent":        result["parent"],
@@ -337,13 +370,11 @@ def sync_tags_to_subtasks(parent_key: str) -> dict:
 
 def sync_business_priority_to_subtasks(parent_key: str) -> dict:
     """
-    Скопировать поле businessPriority родительской задачи во все подзадачи.
+    Синхронизировать businessPriority → подзадачи.
 
-    businessPriority — пользовательское поле, значение обычно объект:
-      {"id": "high", "display": "Высокий"}
-
-    Returns:
-        {parent, businessPriority, subtasks, bulkchange_id, status[, error]}
+    businessPriority — локальное поле типа integer.
+    В API читается под ключом "66af837b466cdf786c0e0ee6--businessPriority",
+    записывается тоже под полным ID через Bulk Change API.
     """
     result = sync_fields_to_subtasks(parent_key, ["businessPriority"])
     return {
@@ -358,14 +389,7 @@ def sync_business_priority_to_subtasks(parent_key: str) -> dict:
 
 def sync_all_fields_to_subtasks(parent_key: str) -> dict:
     """
-    Скопировать ВСЕ наследуемые поля родительской задачи во все подзадачи:
-      - tags
-      - businessPriority
-
-    Один bulk-запрос на все поля сразу.
-
-    Returns:
-        {parent, tags, businessPriority, subtasks, bulkchange_id, status[, error]}
+    Синхронизировать теги И businessPriority одним bulk-запросом → подзадачи.
     """
     logger.info("▶ Полная синхронизация [tags + businessPriority]: %s", parent_key)
     result = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
