@@ -114,7 +114,7 @@ def get_subtasks(parent_key: str) -> list[str]:
     Получить ключи всех прямых подзадач через API связей.
     GET /v3/issues/{parent_key}/links
 
-    Фильтр: type.id == "subtask" AND direction == "inward"
+    Фильтр: type.id == "subtask" AND direction == "outward"
     Работает для задач ЛЮБОГО типа: Эпик, История, Задача, Баг и т.д.
     """
     links = _request("GET", f"/issues/{parent_key}/links")
