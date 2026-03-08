@@ -1,16 +1,15 @@
 """
 Клиент Яндекс Трекер API v3.
 
-Поддерживает наследование от задачи ЛЮБОГО типа к подзадачам:
-  - тегов (tags)              — системное поле
-  - businessPriority          — локальное пользовательское поле (тип integer)
+Все обновления полей выполняются через PATCH /v3/issues/{key}.
+Bulk Change API не используется — он не поддерживает локальные поля.
 
-Локальные поля в Яндекс Трекере хранятся в ответе API под полным ID вида:
-  "<queue_id>--<key>"  (например: "66af837b466cdf786c0e0ee6--businessPriority")
+Для N подзадач запросы выполняются параллельно (ThreadPoolExecutor).
 
-При записи через Bulk Change API тоже нужно использовать полный ID.
+Локальные поля (например businessPriority) хранятся в API-ответе
+под полным ID вида "<queue_id>--<key>". Маппинг задаётся в LOCAL_FIELDS.
 """
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -19,357 +18,276 @@ from logger import get_logger
 
 logger = get_logger(__name__)
 
-BULKCHANGE_POLL_INTERVAL = 2   # сек между запросами статуса
-BULKCHANGE_POLL_TIMEOUT  = 60  # максимальное время ожидания, сек
+PATCH_MAX_WORKERS = 5  # параллельных PATCH-запросов
 
 # ──────────────────────────────────────────────────────────────
-# Маппинг локальных полей: короткий ключ → полный ID в API
-# Полный ID берётся из атрибута "id" поля в ответе API.
+# Локальные поля: короткий ключ → полный ID в API
+# Полный ID берётся из: GET /v3/queues/{queue}/localFields → поле "id"
 # ──────────────────────────────────────────────────────────────
 LOCAL_FIELDS: dict[str, str] = {
     "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
 }
 
 
-def _api_field_key(field_key: str) -> str:
+def _api_key(field_key: str) -> str:
     """
-    Вернуть ключ поля для использования в API-запросах.
+    Вернуть ключ поля для использования в API (чтение и запись).
     Локальные поля подменяются на полный ID.
 
-    Пример:
         "tags"             → "tags"
         "businessPriority" → "66af837b466cdf786c0e0ee6--businessPriority"
     """
     return LOCAL_FIELDS.get(field_key, field_key)
 
 
+# ──────────────────────────────────────────────────────────────
+
 class TrackerAPIError(Exception):
-    """Ошибка при обращении к Яндекс Трекер API."""
+    """Ошибка HTTP-запроса к Яндекс Трекер API."""
     def __init__(self, status_code: int, body: str):
         self.status_code = status_code
         super().__init__(f"HTTP {status_code}: {body}")
 
 
 def _request(method: str, path: str, **kwargs) -> dict | list:
-    """Выполнить HTTP-запрос к Трекер API и вернуть JSON."""
+    """Базовый HTTP-запрос к API. Возвращает JSON или бросает TrackerAPIError."""
     url = f"{config.TRACKER_API_BASE}{path}"
     logger.debug("%s %s", method, url)
     resp = requests.request(
-        method,
-        url,
+        method, url,
         headers=config.get_headers(),
         timeout=30,
         **kwargs,
     )
     if not resp.ok:
-        logger.error(
-            "API error: %s %s → %d %s",
-            method, path, resp.status_code, resp.text[:300],
-        )
+        logger.error("API %s %s → %d %s", method, path, resp.status_code, resp.text[:300])
         raise TrackerAPIError(resp.status_code, resp.text)
-    logger.debug("%s %s → %d", method, path, resp.status_code)
     return resp.json()
 
 
 # ──────────────────────────────────────────────────────────────
-# Операции с задачами
+# Чтение задач
 # ──────────────────────────────────────────────────────────────
 
 def get_issue(issue_key: str) -> dict:
     """
     GET /v3/issues/{issue_key}
-    Локальные поля (LOCAL_FIELDS) запрашиваются явно через ?fields=
-    иначе API их не возвращает по умолчанию.
+
+    Локальные поля явно запрашиваются через ?fields=<id1>,<id2>
+    — без этого API их не возвращает.
     """
     params = {}
     if LOCAL_FIELDS:
-        # Запросить все локальные поля по их полному ID
         params["fields"] = ",".join(LOCAL_FIELDS.values())
     return _request("GET", f"/issues/{issue_key}", params=params)
 
 
-def get_issue_tags(issue_key: str) -> list[str]:
-    """Получить список тегов задачи."""
-    tags = get_issue(issue_key).get("tags") or []
-    logger.debug("Теги [%s]: %s", issue_key, tags)
-    return tags
-
-
-def get_issue_field(issue_key: str, field_key: str):
-    """
-    Получить значение поля задачи по короткому ключу.
-
-    Автоматически подменяет короткий ключ на полный ID для локальных полей.
-
-    Args:
-        issue_key: ключ задачи (например PROJ-1)
-        field_key: короткий ключ поля (например businessPriority)
-
-    Returns:
-        значение поля или None если поле отсутствует
-    """
-    issue = get_issue(issue_key)
-    api_key = _api_field_key(field_key)
-    value = issue.get(api_key)
-    logger.debug("Поле [%s].%s (api_key=%s) = %s", issue_key, field_key, api_key, value)
-    return value
-
-
 def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     """
-    Получить значения нескольких полей задачи за один запрос.
+    Получить значения полей задачи за один запрос.
 
-    Для локальных полей автоматически использует полный ID в API-ответе,
-    но возвращает результат под коротким ключом.
+    Локальные поля читаются по полному ID, но возвращаются
+    под коротким ключом для единообразия.
 
     Args:
         issue_key:  ключ задачи
-        field_keys: список коротких ключей полей
+        field_keys: короткие ключи полей, например ["tags", "businessPriority"]
 
     Returns:
-        {short_key: value} — всегда под коротким ключом
-
-    Пример:
-        get_issue_fields("PROJ-1", ["tags", "businessPriority"])
-        → {"tags": ["backend"], "businessPriority": 3}
+        {"tags": [...], "businessPriority": 900}
     """
     issue = get_issue(issue_key)
-
     result = {}
     for key in field_keys:
-        api_key = _api_field_key(key)
-        value = issue.get(api_key)
+        value = issue.get(_api_key(key))
         result[key] = value
         if value is None:
+            similar = [k for k in issue if key.lower() in k.lower()]
             logger.warning(
-                "Поле '%s' (api_key='%s') не найдено в задаче %s. "
-                "Доступные ключи: %s",
-                key, api_key, issue_key,
-                [k for k in issue.keys() if key.lower() in k.lower()] or "не найдено",
+                "Поле '%s' (api_key='%s') не найдено в %s. Похожие: %s",
+                key, _api_key(key), issue_key, similar or "—",
             )
-
     logger.debug("Поля [%s]: %s", issue_key, result)
     return result
 
 
 def get_subtasks(parent_key: str) -> list[str]:
     """
-    Получить ключи всех прямых подзадач через API связей.
     GET /v3/issues/{parent_key}/links
 
     Фильтр: type.id == "subtask" AND direction == "outward"
-    Работает для задач ЛЮБОГО типа.
+    Работает для задач любого типа (Эпик, История, Задача, Баг).
     """
     links = _request("GET", f"/issues/{parent_key}/links")
-
-    subtask_keys = [
-        link["object"]["key"]
-        for link in links
+    keys = [
+        lnk["object"]["key"]
+        for lnk in links
         if (
-            link.get("type", {}).get("id") == "subtask"
-            and link.get("direction") == "outward"
-            and link.get("object", {}).get("key")
+            lnk.get("type", {}).get("id") == "subtask"
+            and lnk.get("direction") == "outward"
+            and lnk.get("object", {}).get("key")
         )
     ]
-
-    logger.info("Задача %s → подзадач: %d %s", parent_key, len(subtask_keys), subtask_keys)
-    return subtask_keys
+    logger.info("Подзадачи [%s]: %d → %s", parent_key, len(keys), keys)
+    return keys
 
 
 # ──────────────────────────────────────────────────────────────
-# Bulk Change API
+# Обновление задач через PATCH
 # ──────────────────────────────────────────────────────────────
 
-def bulk_update_fields(
-    issue_keys: list[str],
-    fields: dict,
-    notify: bool = False,
-) -> dict:
+def patch_issue(issue_key: str, fields: dict) -> dict:
     """
-    Массово обновить произвольные поля задач одним запросом.
-    POST /v3/bulkchange/_update
+    PATCH /v3/issues/{issue_key}
 
-    Локальные поля автоматически подменяются на полный ID
-    перед отправкой в API.
+    Обновляет одну задачу. Короткие ключи локальных полей
+    автоматически подменяются на полные ID.
 
     Args:
-        issue_keys: ключи задач для обновления (до 10 000)
-        fields:     {short_key: value}
-                    Примеры:
-                      {"tags": ["backend", "sprint-10"]}
-                      {"businessPriority": 3}
-                      {"tags": [...], "businessPriority": 3}
-        notify:     уведомлять исполнителей
+        issue_key: ключ задачи
+        fields:    {"tags": [...], "businessPriority": 900}
+    """
+    payload = {_api_key(k): v for k, v in fields.items()}
+    logger.debug("PATCH [%s] payload=%s", issue_key, payload)
+    return _request("PATCH", f"/issues/{issue_key}", json=payload)
+
+
+def patch_issues_parallel(
+    issue_keys: list[str],
+    fields: dict,
+    max_workers: int = PATCH_MAX_WORKERS,
+) -> dict:
+    """
+    Параллельно обновить несколько задач через PATCH.
+
+    Запускает до max_workers одновременных HTTP-запросов.
+    Ошибки отдельных задач не прерывают обработку остальных.
+
+    Args:
+        issue_keys:  список ключей задач
+        fields:      поля для обновления (короткие ключи)
+        max_workers: число параллельных запросов
 
     Returns:
-        объект bulkchange с полями id, status
+        {
+          "updated": list[str],   # успешно обновлённые ключи
+          "errors":  list[dict],  # [{"issue": key, "error": str}, ...]
+        }
     """
-    # Подменяем короткие ключи на полные API-ключи для локальных полей
-    api_fields = {_api_field_key(k): v for k, v in fields.items()}
+    updated: list[str] = []
+    errors:  list[dict] = []
 
     logger.info(
-        "Bulk update: %d задач → поля %s",
-        len(issue_keys), list(fields.keys()),
+        "PATCH ×%d (workers=%d): поля %s",
+        len(issue_keys), max_workers, list(fields.keys()),
     )
-    logger.debug("API payload values: %s", api_fields)
 
-    return _request("POST", "/bulkchange/_update", json={
-        "issues": issue_keys,
-        "values": api_fields,
-        "notify": notify,
-    })
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(patch_issue, key, fields): key for key in issue_keys}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                future.result()
+                updated.append(key)
+                logger.info("PATCH ✓ [%s]", key)
+            except TrackerAPIError as exc:
+                errors.append({"issue": key, "error": str(exc)})
+                logger.error("PATCH ✗ [%s]: %s", key, exc)
 
-
-def bulk_update_tags(
-    issue_keys: list[str],
-    tags: list[str],
-    notify: bool = False,
-) -> dict:
-    """Массово обновить теги. Обёртка над bulk_update_fields."""
-    return bulk_update_fields(issue_keys, {"tags": tags}, notify)
-
-
-def get_bulkchange_status(bulkchange_id: str) -> dict:
-    """
-    Получить статус задания.
-    GET /v3/bulkchange/{bulkchange_id}
-
-    Статусы: CREATED → RUNNING → DONE | FAILED
-    """
-    return _request("GET", f"/bulkchange/{bulkchange_id}")
-
-
-def wait_for_bulkchange(bulkchange_id: str) -> dict:
-    """
-    Опрашивать статус задания до завершения.
-
-    Raises:
-        TimeoutError    — не завершилось за BULKCHANGE_POLL_TIMEOUT сек
-        TrackerAPIError — завершилось со статусом FAILED
-    """
-    deadline = time.monotonic() + BULKCHANGE_POLL_TIMEOUT
-
-    while time.monotonic() < deadline:
-        job = get_bulkchange_status(bulkchange_id)
-        status = job.get("status", "")
-        logger.debug("BulkChange %s: status=%s", bulkchange_id, status)
-
-        if status == "DONE":
-            logger.info("BulkChange %s → DONE", bulkchange_id)
-            return job
-
-        if status == "FAILED":
-            logger.error("BulkChange %s → FAILED: %s", bulkchange_id, job)
-            raise TrackerAPIError(0, f"BulkChange {bulkchange_id} FAILED: {job}")
-
-        time.sleep(BULKCHANGE_POLL_INTERVAL)
-
-    raise TimeoutError(
-        f"BulkChange {bulkchange_id} не завершился за {BULKCHANGE_POLL_TIMEOUT} сек"
+    logger.info(
+        "PATCH завершён: ✓%d ✗%d из %d",
+        len(updated), len(errors), len(issue_keys),
     )
+    return {"updated": updated, "errors": errors}
 
 
 # ──────────────────────────────────────────────────────────────
-# Бизнес-логика синхронизации
+# Синхронизация
 # ──────────────────────────────────────────────────────────────
 
 def sync_fields_to_subtasks(
     parent_key: str,
     field_keys: list[str],
-    notify: bool = False,
 ) -> dict:
     """
-    Универсальная синхронизация произвольных полей родительской задачи
-    во все её прямые подзадачи через Bulk Change API.
+    Скопировать поля родительской задачи во все прямые подзадачи.
 
-    Работает для задачи ЛЮБОГО типа и любых полей (системных и локальных).
+    Читает значения полей с родителя, затем применяет их ко всем
+    подзадачам через параллельные PATCH-запросы.
 
     Args:
-        parent_key:  ключ родительской задачи
-        field_keys:  список коротких ключей полей
-                     Примеры: ["tags"], ["businessPriority"], ["tags", "businessPriority"]
-        notify:      уведомлять исполнителей
+        parent_key: ключ родительской задачи
+        field_keys: поля для синхронизации, например ["tags", "businessPriority"]
 
     Returns:
         {
-          "parent":        str,
-          "fields":        dict,   # {short_key: value}
-          "subtasks":      list[str],
-          "bulkchange_id": str | None,
-          "status":        str,    # DONE | FAILED | SKIPPED
-          "error":         str,    # только при ошибке
+          "parent":   str,
+          "fields":   dict,       # значения полей родителя
+          "subtasks": list[str],
+          "updated":  list[str],  # успешно обновлённые подзадачи
+          "errors":   list[dict], # [] при полном успехе
+          "status":   str,        # DONE | PARTIAL | FAILED | SKIPPED
         }
     """
-    logger.info("▶ Синхронизация полей %s: %s", field_keys, parent_key)
+    logger.info("▶ Синхронизация %s → %s", field_keys, parent_key)
 
     parent_fields = get_issue_fields(parent_key, field_keys)
-    logger.info("Значения полей [%s]: %s", parent_key, parent_fields)
+    logger.info("Значения [%s]: %s", parent_key, parent_fields)
 
-    # Фильтруем None — не обновляем незаполненные поля
     fields_to_sync = {k: v for k, v in parent_fields.items() if v is not None}
     if not fields_to_sync:
-        logger.warning(
-            "Все поля %s у задачи %s пусты — пропускаем",
-            field_keys, parent_key,
-        )
-        return {
-            "parent": parent_key,
-            "fields": parent_fields,
-            "subtasks": [],
-            "bulkchange_id": None,
-            "status": "SKIPPED",
-        }
+        logger.warning("Все поля %s у %s пусты — пропускаем", field_keys, parent_key)
+        return _result(parent_key, parent_fields, [], [], [], "SKIPPED")
 
     subtasks = get_subtasks(parent_key)
     if not subtasks:
         logger.info("У %s нет подзадач — пропускаем", parent_key)
-        return {
-            "parent": parent_key,
-            "fields": parent_fields,
-            "subtasks": [],
-            "bulkchange_id": None,
-            "status": "SKIPPED",
-        }
+        return _result(parent_key, parent_fields, [], [], [], "SKIPPED")
 
-    job = bulk_update_fields(subtasks, fields_to_sync, notify)
-    bulkchange_id = job["id"]
-    logger.info("BulkChange создан: id=%s задач=%d", bulkchange_id, len(subtasks))
+    patch_result = patch_issues_parallel(subtasks, fields_to_sync)
+    updated = patch_result["updated"]
+    errors  = patch_result["errors"]
 
-    try:
-        final = wait_for_bulkchange(bulkchange_id)
-        logger.info(
-            "◀ Готово [%s]: поля %s → %d подзадач",
-            parent_key, list(fields_to_sync.keys()), len(subtasks),
-        )
-        return {
-            "parent": parent_key,
-            "fields": parent_fields,
-            "subtasks": subtasks,
-            "bulkchange_id": bulkchange_id,
-            "status": final.get("status", "DONE"),
-        }
-    except (TimeoutError, TrackerAPIError) as exc:
-        logger.error("Ошибка BulkChange [%s]: %s", parent_key, exc)
-        return {
-            "parent": parent_key,
-            "fields": parent_fields,
-            "subtasks": subtasks,
-            "bulkchange_id": bulkchange_id,
-            "status": "FAILED",
-            "error": str(exc),
-        }
+    if not errors:
+        status = "DONE"
+    elif updated:
+        status = "PARTIAL"
+    else:
+        status = "FAILED"
 
+    logger.info(
+        "◀ Готово [%s]: %s → %d подзадач, статус=%s, ошибок=%d",
+        parent_key, list(fields_to_sync.keys()), len(subtasks), status, len(errors),
+    )
+    return _result(parent_key, parent_fields, subtasks, updated, errors, status)
+
+
+def _result(parent, fields, subtasks, updated, errors, status) -> dict:
+    """Сформировать стандартный словарь ответа."""
+    return {
+        "parent":   parent,
+        "fields":   fields,
+        "subtasks": subtasks,
+        "updated":  updated,
+        "errors":   errors,
+        "status":   status,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Публичные обёртки
+# ──────────────────────────────────────────────────────────────
 
 def sync_tags_to_subtasks(parent_key: str) -> dict:
     """Синхронизировать теги → подзадачи."""
-    result = sync_fields_to_subtasks(parent_key, ["tags"])
+    r = sync_fields_to_subtasks(parent_key, ["tags"])
     return {
-        "parent":        result["parent"],
-        "tags":          result["fields"].get("tags") or [],
-        "subtasks":      result["subtasks"],
-        "bulkchange_id": result["bulkchange_id"],
-        "status":        result["status"],
-        **( {"error": result["error"]} if "error" in result else {} ),
+        "parent":   r["parent"],
+        "tags":     r["fields"].get("tags") or [],
+        "subtasks": r["subtasks"],
+        "updated":  r["updated"],
+        "errors":   r["errors"],
+        "status":   r["status"],
     }
 
 
@@ -377,33 +295,33 @@ def sync_business_priority_to_subtasks(parent_key: str) -> dict:
     """
     Синхронизировать businessPriority → подзадачи.
 
-    businessPriority — локальное поле типа integer.
-    В API читается под ключом "66af837b466cdf786c0e0ee6--businessPriority",
-    записывается тоже под полным ID через Bulk Change API.
+    Локальное поле типа integer (например 900).
+    Записывается через PATCH с полным ID поля.
     """
-    result = sync_fields_to_subtasks(parent_key, ["businessPriority"])
+    r = sync_fields_to_subtasks(parent_key, ["businessPriority"])
     return {
-        "parent":           result["parent"],
-        "businessPriority": result["fields"].get("businessPriority"),
-        "subtasks":         result["subtasks"],
-        "bulkchange_id":    result["bulkchange_id"],
-        "status":           result["status"],
-        **( {"error": result["error"]} if "error" in result else {} ),
+        "parent":           r["parent"],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "subtasks":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
     }
 
 
 def sync_all_fields_to_subtasks(parent_key: str) -> dict:
     """
-    Синхронизировать теги И businessPriority одним bulk-запросом → подзадачи.
+    Синхронизировать теги И businessPriority → подзадачи.
+    Один вызов — все поля одновременно в каждом PATCH-запросе.
     """
     logger.info("▶ Полная синхронизация [tags + businessPriority]: %s", parent_key)
-    result = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
+    r = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
     return {
-        "parent":           result["parent"],
-        "tags":             result["fields"].get("tags") or [],
-        "businessPriority": result["fields"].get("businessPriority"),
-        "subtasks":         result["subtasks"],
-        "bulkchange_id":    result["bulkchange_id"],
-        "status":           result["status"],
-        **( {"error": result["error"]} if "error" in result else {} ),
+        "parent":           r["parent"],
+        "tags":             r["fields"].get("tags") or [],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "subtasks":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
     }
