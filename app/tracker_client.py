@@ -76,7 +76,7 @@ def _request(method: str, path: str, **kwargs) -> dict | list:
 # ──────────────────────────────────────────────────────────────
 
 def get_issue(issue_key: str) -> dict:
-      """
+    """
     GET /v3/issues/{issue_key}
     Локальные поля (LOCAL_FIELDS) запрашиваются явно через ?fields=
     иначе API их не возвращает по умолчанию.
