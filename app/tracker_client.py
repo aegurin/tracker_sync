@@ -1,13 +1,15 @@
 """
 Клиент Яндекс Трекер API v3.
 
-
 Все обновления полей выполняются через PATCH /v3/issues/{key}.
-
-Для N подзадач запросы выполняются параллельно (ThreadPoolExecutor).
+Запросы для N подзадач выполняются параллельно (ThreadPoolExecutor).
 
 Локальные поля (например businessPriority) хранятся в API-ответе
 под полным ID вида "<queue_id>--<key>". Маппинг задаётся в LOCAL_FIELDS.
+
+ВАЖНО: параметр ?fields= в GET /v3/issues/{key} ЗАМЕНЯЕТ дефолтный набор
+полей ответа. Поэтому при запросе локальных полей нужно явно включать
+в ?fields= и системные поля (tags и т.д.), иначе они не вернутся.
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,8 +23,8 @@ logger = get_logger(__name__)
 PATCH_MAX_WORKERS = 5  # параллельных PATCH-запросов
 
 # ──────────────────────────────────────────────────────────────
-# Локальные поля: короткий ключ → полный ID в API
-# Полный ID берётся из: GET /v3/queues/{queue}/localFields → поле "id"
+# Локальные поля: короткий ключ → полный ID в API ответа/запроса
+# Полный ID: GET /v3/queues/{queue}/localFields → поле "id"
 # ──────────────────────────────────────────────────────────────
 LOCAL_FIELDS: dict[str, str] = {
     "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
@@ -31,8 +33,8 @@ LOCAL_FIELDS: dict[str, str] = {
 
 def _api_key(field_key: str) -> str:
     """
-    Вернуть ключ поля для использования в API (чтение и запись).
-    Локальные поля подменяются на полный ID.
+    Короткий ключ → API ключ для чтения и записи.
+    Системные поля возвращаются без изменений.
 
         "tags"             → "tags"
         "businessPriority" → "66af837b466cdf786c0e0ee6--businessPriority"
@@ -69,16 +71,22 @@ def _request(method: str, path: str, **kwargs) -> dict | list:
 # Чтение задач
 # ──────────────────────────────────────────────────────────────
 
-def get_issue(issue_key: str) -> dict:
+def get_issue(issue_key: str, api_keys: list[str] | None = None) -> dict:
     """
     GET /v3/issues/{issue_key}
 
-    Локальные поля явно запрашиваются через ?fields=<id1>,<id2>
-    — без этого API их не возвращает.
+    api_keys — список API-ключей для параметра ?fields=
+    Если передан, API вернёт ТОЛЬКО эти поля (дефолтный набор заменяется).
+    Если None — API вернёт стандартный набор полей (без локальных).
+
+    Правило:
+      - Нужны только системные поля → api_keys=None (дефолтный ответ)
+      - Нужны локальные поля       → api_keys=[..., "66af837b..."]
+      - Нужны оба типа              → api_keys=["tags", "66af837b..."]
     """
     params = {}
-    if LOCAL_FIELDS:
-        params["fields"] = ",".join(LOCAL_FIELDS.values())
+    if api_keys:
+        params["fields"] = ",".join(api_keys)
     return _request("GET", f"/issues/{issue_key}", params=params)
 
 
@@ -86,8 +94,12 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     """
     Получить значения полей задачи за один запрос.
 
-    Локальные поля читаются по полному ID, но возвращаются
-    под коротким ключом для единообразия.
+    Корректно строит ?fields= с учётом типа каждого поля:
+      - Если среди field_keys есть локальные поля → передаём ?fields=
+        со ВСЕМИ запрошенными ключами (и системными и локальными)
+      - Если только системные → не передаём ?fields= (дефолтный ответ)
+
+    Локальные поля читаются по полному ID, возвращаются под коротким ключом.
 
     Args:
         issue_key:  ключ задачи
@@ -96,7 +108,19 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     Returns:
         {"tags": [...], "businessPriority": 900}
     """
-    issue = get_issue(issue_key)
+    has_local = any(k in LOCAL_FIELDS for k in field_keys)
+
+    if has_local:
+        # Нужно явно запросить все поля — и системные и локальные
+        # иначе ?fields=localId заменит дефолтный набор и системные пропадут
+        api_keys_to_request = [_api_key(k) for k in field_keys]
+        issue = get_issue(issue_key, api_keys=api_keys_to_request)
+        logger.debug("GET [%s] ?fields=%s", issue_key, ",".join(api_keys_to_request))
+    else:
+        # Только системные поля — дефолтный ответ содержит их все
+        issue = get_issue(issue_key)
+        logger.debug("GET [%s] (default fields)", issue_key)
+
     result = {}
     for key in field_keys:
         value = issue.get(_api_key(key))
@@ -116,7 +140,7 @@ def get_subtasks(parent_key: str) -> list[str]:
     GET /v3/issues/{parent_key}/links
 
     Фильтр: type.id == "subtask" AND direction == "outward"
-    Работает для задач любого типа (Эпик, История, Задача, Баг).
+    Работает для задач любого типа.
     """
     links = _request("GET", f"/issues/{parent_key}/links")
     keys = [
@@ -132,6 +156,16 @@ def get_subtasks(parent_key: str) -> list[str]:
     return keys
 
 
+def has_parent(issue_key: str) -> bool:
+    """
+    Проверить, является ли задача подзадачей (имеет ли родителя).
+    Используется для защиты от каскадных вызовов триггера:
+    когда PATCH на подзадаче провоцирует повторный webhook.
+    """
+    issue = get_issue(issue_key)
+    return "parent" in issue and issue["parent"] is not None
+
+
 # ──────────────────────────────────────────────────────────────
 # Обновление задач через PATCH
 # ──────────────────────────────────────────────────────────────
@@ -140,8 +174,7 @@ def patch_issue(issue_key: str, fields: dict) -> dict:
     """
     PATCH /v3/issues/{issue_key}
 
-    Обновляет одну задачу. Короткие ключи локальных полей
-    автоматически подменяются на полные ID.
+    Короткие ключи локальных полей автоматически подменяются на полные ID.
 
     Args:
         issue_key: ключ задачи
@@ -160,13 +193,7 @@ def patch_issues_parallel(
     """
     Параллельно обновить несколько задач через PATCH.
 
-    Запускает до max_workers одновременных HTTP-запросов.
     Ошибки отдельных задач не прерывают обработку остальных.
-
-    Args:
-        issue_keys:  список ключей задач
-        fields:      поля для обновления (короткие ключи)
-        max_workers: число параллельных запросов
 
     Returns:
         {
@@ -194,10 +221,7 @@ def patch_issues_parallel(
                 errors.append({"issue": key, "error": str(exc)})
                 logger.error("PATCH ✗ [%s]: %s", key, exc)
 
-    logger.info(
-        "PATCH завершён: ✓%d ✗%d из %d",
-        len(updated), len(errors), len(issue_keys),
-    )
+    logger.info("PATCH завершён: ✓%d ✗%d из %d", len(updated), len(errors), len(issue_keys))
     return {"updated": updated, "errors": errors}
 
 
@@ -212,24 +236,23 @@ def sync_fields_to_subtasks(
     """
     Скопировать поля родительской задачи во все прямые подзадачи.
 
-    Читает значения полей с родителя, затем применяет их ко всем
-    подзадачам через параллельные PATCH-запросы.
+    Защита от каскада: если задача сама является подзадачей (имеет parent),
+    синхронизация не выполняется → статус SKIPPED.
 
     Args:
-        parent_key: ключ родительской задачи
+        parent_key: ключ задачи-родителя
         field_keys: поля для синхронизации, например ["tags", "businessPriority"]
 
     Returns:
-        {
-          "parent":   str,
-          "fields":   dict,       # значения полей родителя
-          "subtasks": list[str],
-          "updated":  list[str],  # успешно обновлённые подзадачи
-          "errors":   list[dict], # [] при полном успехе
-          "status":   str,        # DONE | PARTIAL | FAILED | SKIPPED
-        }
+        {parent, fields, subtasks, updated, errors,
+         status: DONE|PARTIAL|FAILED|SKIPPED}
     """
     logger.info("▶ Синхронизация %s → %s", field_keys, parent_key)
+
+    # Защита от каскада: подзадачи не синхронизируем
+    if has_parent(parent_key):
+        logger.info("Задача %s имеет родителя — пропускаем (защита от каскада)", parent_key)
+        return _result(parent_key, {}, [], [], [], "SKIPPED")
 
     parent_fields = get_issue_fields(parent_key, field_keys)
     logger.info("Значения [%s]: %s", parent_key, parent_fields)
@@ -263,7 +286,6 @@ def sync_fields_to_subtasks(
 
 
 def _result(parent, fields, subtasks, updated, errors, status) -> dict:
-    """Сформировать стандартный словарь ответа."""
     return {
         "parent":   parent,
         "fields":   fields,
@@ -294,9 +316,7 @@ def sync_tags_to_subtasks(parent_key: str) -> dict:
 def sync_business_priority_to_subtasks(parent_key: str) -> dict:
     """
     Синхронизировать businessPriority → подзадачи.
-
-    Локальное поле типа integer (например 900).
-    Записывается через PATCH с полным ID поля.
+    Локальное поле типа integer. Записывается через PATCH с полным ID поля.
     """
     r = sync_fields_to_subtasks(parent_key, ["businessPriority"])
     return {
@@ -311,8 +331,8 @@ def sync_business_priority_to_subtasks(parent_key: str) -> dict:
 
 def sync_all_fields_to_subtasks(parent_key: str) -> dict:
     """
-    Синхронизировать теги И businessPriority → подзадачи.
-    Один вызов — все поля одновременно в каждом PATCH-запросе.
+    Синхронизировать теги И businessPriority → подзадачи одним вызовом.
+    Каждый PATCH-запрос обновляет оба поля одновременно.
     """
     logger.info("▶ Полная синхронизация [tags + businessPriority]: %s", parent_key)
     r = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
