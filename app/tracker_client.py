@@ -76,11 +76,16 @@ def _request(method: str, path: str, **kwargs) -> dict | list:
 # ──────────────────────────────────────────────────────────────
 
 def get_issue(issue_key: str) -> dict:
-    """
-    Получить все данные задачи включая локальные поля.
+      """
     GET /v3/issues/{issue_key}
+    Локальные поля (LOCAL_FIELDS) запрашиваются явно через ?fields=
+    иначе API их не возвращает по умолчанию.
     """
-    return _request("GET", f"/issues/{issue_key}")
+    params = {}
+    if LOCAL_FIELDS:
+        # Запросить все локальные поля по их полному ID
+        params["fields"] = ",".join(LOCAL_FIELDS.values())
+    return _request("GET", f"/issues/{issue_key}", params=params)
 
 
 def get_issue_tags(issue_key: str) -> list[str]:
