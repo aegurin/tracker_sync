@@ -36,7 +36,7 @@ def _check_secret() -> bool:
     return request.headers.get("X-Tracker-Secret") == config.WEBHOOK_SECRET
 
 
-d"""
+"""
 Webhook-сервер для обработки запросов от триггеров Яндекс Трекера.
 
 Эндпоинты:
