@@ -338,56 +338,6 @@ def _result(parent, fields, subtasks, updated, errors, status) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# Публичные обёртки
-# ──────────────────────────────────────────────────────────────
-
-def sync_tags_to_subtasks(parent_key: str) -> dict:
-    """Синхронизировать теги → подзадачи."""
-    r = sync_fields_to_subtasks(parent_key, ["tags"])
-    return {
-        "parent":   r["parent"],
-        "tags":     r["fields"].get("tags") or [],
-        "subtasks": r["subtasks"],
-        "updated":  r["updated"],
-        "errors":   r["errors"],
-        "status":   r["status"],
-    }
-
-
-def sync_business_priority_to_subtasks(parent_key: str) -> dict:
-    """
-    Синхронизировать businessPriority → подзадачи.
-    Локальное поле типа integer. Записывается через PATCH с полным ID поля.
-    """
-    r = sync_fields_to_subtasks(parent_key, ["businessPriority"])
-    return {
-        "parent":           r["parent"],
-        "businessPriority": r["fields"].get("businessPriority"),
-        "subtasks":         r["subtasks"],
-        "updated":          r["updated"],
-        "errors":           r["errors"],
-        "status":           r["status"],
-    }
-
-
-def sync_all_fields_to_subtasks(parent_key: str) -> dict:
-    """
-    Синхронизировать теги И businessPriority → подзадачи одним вызовом.
-    Каждый PATCH-запрос обновляет оба поля одновременно.
-    """
-    logger.info("▶ Полная синхронизация [tags + businessPriority]: %s", parent_key)
-    r = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
-    return {
-        "parent":           r["parent"],
-        "tags":             r["fields"].get("tags") or [],
-        "businessPriority": r["fields"].get("businessPriority"),
-        "subtasks":         r["subtasks"],
-        "updated":          r["updated"],
-        "errors":           r["errors"],
-        "status":           r["status"],
-    }
-
-# ──────────────────────────────────────────────────────────────
 # Получение блокирующих очередей
 # ──────────────────────────────────────────────────────────────
 
@@ -432,3 +382,142 @@ def get_blocker_issues(issue_key: str) -> list[str]:
         issue_key, len(all_blockers), len(allowed_blockers), allowed_blockers,
     )
     return allowed_blockers
+
+def sync_fields_to_blockers(
+    source_key: str,
+    field_keys: list[str],
+) -> dict:
+    """
+    Скопировать поля эпика-источника в ВСЕ эпики, которые его блокируют.
+
+    Используется для кросс-очередной передачи:
+      ENGINEERING-EPIC → все связанные BACKENDTEAM-EPIC (через связь "blocks").
+
+    Args:
+        source_key:  ключ задачи-источника (напр. "ENG-42")
+        field_keys:  поля для синхронизации ["tags", "businessPriority"]
+
+    Returns:
+        стандартный словарь результата (аналогично sync_fields_to_subtasks)
+    """
+    logger.info("▶ Кросс-очередная синхронизация %s → блокирующие задачи", source_key)
+
+    source_fields = get_issue_fields(source_key, field_keys)
+    logger.info("Значения источника [%s]: %s", source_key, source_fields)
+
+    fields_to_sync = {k: v for k, v in source_fields.items() if v is not None}
+    if not fields_to_sync:
+        logger.warning("Все поля %s у %s пусты — пропускаем", field_keys, source_key)
+        return _result(source_key, source_fields, [], [], [], "SKIPPED")
+
+    blockers = get_blocker_issues(source_key)
+    if not blockers:
+        logger.info("У %s нет блокирующих задач — пропускаем", source_key)
+        return _result(source_key, source_fields, [], [], [], "SKIPPED")
+
+    patch_result = patch_issues_parallel(blockers, fields_to_sync)
+    updated = patch_result["updated"]
+    errors  = patch_result["errors"]
+
+    status = "DONE" if not errors else ("PARTIAL" if updated else "FAILED")
+
+    logger.info(
+        "◀ Кросс-синхронизация [%s]: %s → %d блокирующих задач, статус=%s",
+        source_key, list(fields_to_sync.keys()), len(blockers), status,
+    )
+    return _result(source_key, source_fields, blockers, updated, errors, status)
+
+
+
+# ──────────────────────────────────────────────────────────────
+# Публичные обёртки
+# ──────────────────────────────────────────────────────────────
+
+def sync_tags_to_subtasks(parent_key: str) -> dict:
+    """Синхронизировать теги → подзадачи."""
+    r = sync_fields_to_subtasks(parent_key, ["tags"])
+    return {
+        "parent":   r["parent"],
+        "tags":     r["fields"].get("tags") or [],
+        "subtasks": r["subtasks"],
+        "updated":  r["updated"],
+        "errors":   r["errors"],
+        "status":   r["status"],
+    }
+
+
+def sync_business_priority_to_subtasks(parent_key: str) -> dict:
+    """
+    Синхронизировать businessPriority → подзадачи.
+    Локальное поле типа integer. Записывается через PATCH с полным ID поля.
+    """
+    r = sync_fields_to_subtasks(parent_key, ["businessPriority"])
+    return {
+        "parent":           r["parent"],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "subtasks":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }
+
+def sync_tags_to_blockers(source_key: str) -> dict:
+    """
+    Синхронизировать ТОЛЬКО теги ENG-эпика → блокирующие BACKEND-эпики.
+    Триггер: поле tags изменилось на эпике очереди Engineering.
+    """
+    r = sync_fields_to_blockers(source_key, ["tags"])
+    return {
+        "source":   r["parent"],
+        "tags":     r["fields"].get("tags") or [],
+        "blockers": r["subtasks"],
+        "updated":  r["updated"],
+        "errors":   r["errors"],
+        "status":   r["status"],
+    }
+
+def sync_business_priority_to_blockers(source_key: str) -> dict:
+    """
+    Синхронизировать ТОЛЬКО businessPriority ENG-эпика → блокирующие BACKEND-эпики.
+    Триггер: поле businessPriority изменилось на эпике очереди Engineering.
+    """
+    r = sync_fields_to_blockers(source_key, ["businessPriority"])
+    return {
+        "source":           r["parent"],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "blockers":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }
+
+def sync_all_fields_to_subtasks(parent_key: str) -> dict:
+    """
+    Синхронизировать теги И businessPriority → подзадачи одним вызовом.
+    Каждый PATCH-запрос обновляет оба поля одновременно.
+    """
+    logger.info("▶ Полная синхронизация [tags + businessPriority]: %s", parent_key)
+    r = sync_fields_to_subtasks(parent_key, ["tags", "businessPriority"])
+    return {
+        "parent":           r["parent"],
+        "tags":             r["fields"].get("tags") or [],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "subtasks":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }
+
+def sync_all_fields_to_blockers(source_key: str) -> dict:
+    """Синхронизировать tags + businessPriority из source_key во все блокирующие задачи."""
+    logger.info("▶ Полная кросс-синхронизация [tags + businessPriority]: %s", source_key)
+    r = sync_fields_to_blockers(source_key, ["tags", "businessPriority"])
+    return {
+        "source":           r["parent"],
+        "tags":             r["fields"].get("tags") or [],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "blockers":         r["subtasks"],   # список блокирующих задач
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }

@@ -64,6 +64,9 @@ from tracker_client import (
     sync_tags_to_subtasks,
     sync_business_priority_to_subtasks,
     sync_all_fields_to_subtasks,
+    sync_tags_to_blockers,
+    sync_business_priority_to_blockers,
+    sync_all_fields_to_blockers,
     TrackerAPIError,
 )
 
@@ -166,6 +169,28 @@ def webhook_priority_sync():
 def webhook_full_sync():
     """Триггер: Теги ИЛИ businessPriority → «Значение поля изменилось»"""
     return _handle(sync_all_fields_to_subtasks, _get_issue_key())
+
+@app.post("/webhook/cross-queue-tags-sync")
+def webhook_cross_queue_tags():
+    """
+    Синхронизировать ТЕГИ из ENG-эпика → блокирующие BACKEND-эпики.
+
+    Триггер ENGINEERING: Тип задачи = Эпик, Теги → «Значение поля изменилось»
+    Тело: {"issue_key": "{{issue.key}}"}
+    """
+    return _handle(sync_tags_to_blockers, _get_issue_key())
+
+
+@app.post("/webhook/cross-queue-priority-sync")
+def webhook_cross_queue_priority():
+    """
+    Синхронизировать BUSINESS PRIORITY из ENG-эпика → блокирующие BACKEND-эпики.
+
+    Триггер ENGINEERING: Тип задачи = Эпик, businessPriority → «Значение поля изменилось»
+    Тело: {"issue_key": "{{issue.key}}"}
+    """
+    return _handle(sync_business_priority_to_blockers, _get_issue_key())
+
 
 
 # ──────────────────────────────────────────────────────────────
