@@ -20,7 +20,7 @@ TRACKER_QUEUE_KEY = os.getenv("TRACKER_QUEUE_KEY", "")
 # Список префиксов через запятую: "BACKENDTEAM,INFRA,PLATFORM"
 # Пустая строка = разрешены ВСЕ очереди (без фильтра)
 # ──────────────────────────────────────────────────────────────
-BLOCKER_ALLOWED_QUEUES_RAW = os.getenv("BACKENDTEAM")
+BLOCKER_ALLOWED_QUEUES_RAW = os.getenv("BLOCKER_ALLOWED_QUEUES", "BACKENDTEAM")
 
 BLOCKER_ALLOWED_QUEUES: list[str] = [
     q.strip().upper()
