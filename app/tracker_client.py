@@ -5,7 +5,9 @@
 Запросы для N подзадач выполняются параллельно (ThreadPoolExecutor).
 
 Локальные поля (например businessPriority) хранятся в API-ответе
-под полным ID вида "<queue_id>--<key>". Маппинг задаётся в LOCAL_FIELDS.
+под полным ID вида "{hash}--{fieldKey}". Маппинг задаётся в QUEUE_LOCAL_FIELDS
+отдельно для каждой очереди, так как одно и то же поле имеет разные ID
+в разных очередях.
 
 ВАЖНО: параметр ?fields= в GET /v3/issues/{key} ЗАМЕНЯЕТ дефолтный набор
 полей ответа. Поэтому при запросе локальных полей нужно явно включать
@@ -22,27 +24,83 @@ logger = get_logger(__name__)
 
 PATCH_MAX_WORKERS = 5  # параллельных PATCH-запросов
 
-# ──────────────────────────────────────────────────────────────
-# Локальные поля: короткий ключ → полный ID в API ответа/запроса
-# Полный ID: GET /v3/queues/{queue}/localFields → поле "id"
-# ──────────────────────────────────────────────────────────────
-LOCAL_FIELDS: dict[str, str] = {
-    "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-queue маппинг локальных полей: очередь → { короткий_ключ → API_ID }
+#
+# Одно и то же поле "businessPriority" имеет разные ID в разных очередях.
+# Чтобы добавить новую очередь:
+#   "NEWQUEUE": {"businessPriority": "xxxxxxxxxxxxxxxxxxxxxxxx--businessPriority"}
+#
+# Получить ID: GET /v3/queues/{QUEUE}/localFields → поле "id"
+# ──────────────────────────────────────────────────────────────────────────────
+
+QUEUE_LOCAL_FIELDS: dict[str, dict[str, str]] = {
+    "BACKENDTEAM": {
+        "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
+    },
+    "ENGINEERINGTEAM": {
+        "businessPriority": "66af8412375a31188f658397--businessPriority",
+    },
 }
 
 
-def _api_key(field_key: str) -> str:
+def _queue_of(issue_key: str) -> str:
+    """'ENGINEERINGTEAM-3701' → 'ENGINEERINGTEAM'"""
+    return issue_key.split("-")[0].upper()
+
+
+def _api_key(field_key: str, issue_key: str) -> str:
     """
-    Короткий ключ → API ключ для чтения и записи.
-    Системные поля возвращаются без изменений.
+    Вернуть API-идентификатор поля для конкретной задачи.
 
-        "tags"             → "tags"
-        "businessPriority" → "66af837b466cdf786c0e0ee6--businessPriority"
+    Системные поля (tags, summary и т.д.) возвращаются без изменений.
+    Локальные поля подставляются по очереди задачи.
+
+    Примеры:
+        _api_key("tags",             "ANY-1")              → "tags"
+        _api_key("businessPriority", "BACKENDTEAM-7")      → "66af837b...--businessPriority"
+        _api_key("businessPriority", "ENGINEERINGTEAM-3701") → "66af8412...--businessPriority"
     """
-    return LOCAL_FIELDS.get(field_key, field_key)
+    queue = _queue_of(issue_key)
+    return QUEUE_LOCAL_FIELDS.get(queue, {}).get(field_key, field_key)
 
 
-# ──────────────────────────────────────────────────────────────
+def _has_local_fields(field_keys: list[str], issue_key: str) -> bool:
+    """Есть ли среди запрошенных полей хотя бы одно локальное для данной очереди?"""
+    queue = _queue_of(issue_key)
+    queue_fields = QUEUE_LOCAL_FIELDS.get(queue, {})
+    return any(k in queue_fields for k in field_keys)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Вспомогательные функции фильтрации по очереди (для кросс-синхронизации)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _is_queue_allowed(issue_key: str) -> bool:
+    """
+    Проверить, разрешена ли очередь задачи для кросс-синхронизации.
+
+    Если config.BLOCKER_ALLOWED_QUEUES пуст — разрешены все очереди.
+    Иначе — только те, чей префикс есть в списке.
+
+    Examples:
+        'BACKENDTEAM-7'      → True   (если BLOCKER_ALLOWED_QUEUES=['BACKENDTEAM'])
+        'INFRA-3'            → False  (INFRA не в списке)
+        'BACKENDTEAM-7'      → True   (если BLOCKER_ALLOWED_QUEUES=[] — всё разрешено)
+    """
+    if not config.BLOCKER_ALLOWED_QUEUES:
+        return True
+    queue = _queue_of(issue_key)
+    allowed = queue in config.BLOCKER_ALLOWED_QUEUES
+    if not allowed:
+        logger.debug(
+            "Очередь '%s' не в BLOCKER_ALLOWED_QUEUES=%s — пропускаем",
+            queue, config.BLOCKER_ALLOWED_QUEUES,
+        )
+    return allowed
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 class TrackerAPIError(Exception):
     """Ошибка HTTP-запроса к Яндекс Трекер API."""
@@ -67,9 +125,9 @@ def _request(method: str, path: str, **kwargs) -> dict | list:
     return resp.json()
 
 
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Чтение задач
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def get_issue(issue_key: str, api_keys: list[str] | None = None) -> dict:
     """
@@ -80,9 +138,9 @@ def get_issue(issue_key: str, api_keys: list[str] | None = None) -> dict:
     Если None — API вернёт стандартный набор полей (без локальных).
 
     Правило:
-      - Нужны только системные поля → api_keys=None (дефолтный ответ)
-      - Нужны локальные поля       → api_keys=[..., "66af837b..."]
-      - Нужны оба типа              → api_keys=["tags", "66af837b..."]
+      - Нужны только системные поля  → api_keys=None (дефолтный ответ)
+      - Нужны локальные поля          → api_keys=[..., "66af837b..."]
+      - Нужны оба типа                → api_keys=["tags", "66af837b..."]
     """
     params = {}
     if api_keys:
@@ -94,12 +152,13 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     """
     Получить значения полей задачи за один запрос.
 
-    Корректно строит ?fields= с учётом типа каждого поля:
+    Корректно строит ?fields= с учётом очереди задачи:
       - Если среди field_keys есть локальные поля → передаём ?fields=
         со ВСЕМИ запрошенными ключами (и системными и локальными)
       - Если только системные → не передаём ?fields= (дефолтный ответ)
 
-    Локальные поля читаются по полному ID, возвращаются под коротким ключом.
+    Локальные поля читаются по полному ID (очередь-специфичному),
+    возвращаются под коротким ключом.
 
     Args:
         issue_key:  ключ задачи
@@ -108,12 +167,10 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     Returns:
         {"tags": [...], "businessPriority": 900}
     """
-    has_local = any(k in LOCAL_FIELDS for k in field_keys)
-
-    if has_local:
-        # Нужно явно запросить все поля — и системные и локальные
-        # иначе ?fields=localId заменит дефолтный набор и системные пропадут
-        api_keys_to_request = [_api_key(k) for k in field_keys]
+    if _has_local_fields(field_keys, issue_key):
+        # Явно запрашиваем все поля — и системные и локальные
+        # (иначе ?fields=localId заменит дефолтный набор и системные пропадут)
+        api_keys_to_request = [_api_key(k, issue_key) for k in field_keys]
         issue = get_issue(issue_key, api_keys=api_keys_to_request)
         logger.debug("GET [%s] ?fields=%s", issue_key, ",".join(api_keys_to_request))
     else:
@@ -123,14 +180,16 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
 
     result = {}
     for key in field_keys:
-        value = issue.get(_api_key(key))
+        a_key = _api_key(key, issue_key)
+        value = issue.get(a_key)
         result[key] = value
         if value is None:
             similar = [k for k in issue if key.lower() in k.lower()]
             logger.warning(
                 "Поле '%s' (api_key='%s') не найдено в %s. Похожие: %s",
-                key, _api_key(key), issue_key, similar or "—",
+                key, a_key, issue_key, similar or "—",
             )
+
     logger.debug("Поля [%s]: %s", issue_key, result)
     return result
 
@@ -166,21 +225,76 @@ def has_parent(issue_key: str) -> bool:
     return "parent" in issue and issue["parent"] is not None
 
 
-# ──────────────────────────────────────────────────────────────
+def get_blocker_issues(issue_key: str) -> list[str]:
+    """
+    GET /v3/issues/{issue_key}/links
+
+    Ищет задачи, которые БЛОКИРУЮТ issue_key (т.е. issue_key зависит от них).
+
+    Реальная структура ответа Трекера (проверено на ENGINEERINGTEAM-3701):
+      type.id   = "depends"   — тип связи «зависимость»
+      direction = "outward"   — «текущая задача ЗАВИСИТ ОТ объекта»
+                              = объект является блокером текущей задачи
+
+    БЫЛО (неверно):  type.id == "blocks"  AND direction == "inward"
+    СТАЛО (верно):   type.id == "depends" AND direction == "outward"
+    """
+    links = _request("GET", f"/issues/{issue_key}/links")
+
+    if config.LOG_LINKS_RAW:
+        logger.debug("RAW links [%s]: %s", issue_key, links)
+
+    all_blockers = [
+        lnk["object"]["key"]
+        for lnk in links
+        if (
+            lnk.get("type", {}).get("id") == "depends"
+            and lnk.get("direction") == "outward"
+            and lnk.get("object", {}).get("key")
+        )
+    ]
+
+    allowed_blockers = [k for k in all_blockers if _is_queue_allowed(k)]
+    skipped = set(all_blockers) - set(allowed_blockers)
+
+    if skipped:
+        logger.warning(
+            "Блокирующие задачи пропущены (очередь не в BLOCKER_ALLOWED_QUEUES=%s): %s",
+            config.BLOCKER_ALLOWED_QUEUES, sorted(skipped),
+        )
+
+    logger.info(
+        "Блокирующие задачи [%s]: всего=%d, разрешено=%d → %s",
+        issue_key, len(all_blockers), len(allowed_blockers), allowed_blockers,
+    )
+    return allowed_blockers
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Обновление задач через PATCH
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 def patch_issue(issue_key: str, fields: dict) -> dict:
     """
     PATCH /v3/issues/{issue_key}
 
-    Короткие ключи локальных полей автоматически подменяются на полные ID.
+    fields — { короткий_ключ: значение }, например:
+        {"tags": ["backend"], "businessPriority": 900}
 
-    Args:
-        issue_key: ключ задачи
-        fields:    {"tags": [...], "businessPriority": 900}
+    API-идентификаторы полей подставляются автоматически
+    по очереди issue_key из QUEUE_LOCAL_FIELDS.
+
+    В режиме DRY_RUN=true логирует payload, но НЕ отправляет запрос.
     """
-    payload = {_api_key(k): v for k, v in fields.items()}
+    payload = {_api_key(k, issue_key): v for k, v in fields.items()}
+
+    if config.DRY_RUN:
+        logger.info(
+            "DRY_RUN: PATCH [%s] НЕ выполнен, payload=%s",
+            issue_key, payload,
+        )
+        return {"key": issue_key, "dry_run": True}
+
     logger.debug("PATCH [%s] payload=%s", issue_key, payload)
     return _request("PATCH", f"/issues/{issue_key}", json=payload)
 
@@ -193,21 +307,25 @@ def patch_issues_parallel(
     """
     Параллельно обновить несколько задач через PATCH.
 
+    Каждая задача получает payload с API-ключами своей очереди
+    (вычисляются внутри patch_issue).
+
     Ошибки отдельных задач не прерывают обработку остальных.
 
     Returns:
         {
-          "updated": list[str],   # успешно обновлённые ключи
-          "errors":  list[dict],  # [{"issue": key, "error": str}, ...]
+            "updated": list[str],        # успешно обновлённые ключи
+            "errors":  list[dict],       # [{"issue": key, "error": str}, ...]
         }
     """
-    updated: list[str] = []
-    errors:  list[dict] = []
-
+    mode = "DRY_RUN" if config.DRY_RUN else "LIVE"
     logger.info(
-        "PATCH ×%d (workers=%d): поля %s",
-        len(issue_keys), max_workers, list(fields.keys()),
+        "PATCH ×%d (workers=%d, mode=%s): поля %s",
+        len(issue_keys), max_workers, mode, list(fields.keys()),
     )
+
+    updated: list[str] = []
+    errors: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(patch_issue, key, fields): key for key in issue_keys}
@@ -225,14 +343,11 @@ def patch_issues_parallel(
     return {"updated": updated, "errors": errors}
 
 
-# ──────────────────────────────────────────────────────────────
-# Синхронизация
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Синхронизация: родитель → подзадачи
+# ──────────────────────────────────────────────────────────────────────────────
 
-def sync_fields_to_subtasks(
-    parent_key: str,
-    field_keys: list[str],
-) -> dict:
+def sync_fields_to_subtasks(parent_key: str, field_keys: list[str]) -> dict:
     """
     Скопировать поля родительской задачи во все прямые подзадачи.
 
@@ -249,7 +364,6 @@ def sync_fields_to_subtasks(
     """
     logger.info("▶ Синхронизация %s → %s", field_keys, parent_key)
 
-    # Защита от каскада: подзадачи не синхронизируем
     if has_parent(parent_key):
         logger.info("Задача %s имеет родителя — пропускаем (защита от каскада)", parent_key)
         return _result(parent_key, {}, [], [], [], "SKIPPED")
@@ -270,13 +384,7 @@ def sync_fields_to_subtasks(
     patch_result = patch_issues_parallel(subtasks, fields_to_sync)
     updated = patch_result["updated"]
     errors  = patch_result["errors"]
-
-    if not errors:
-        status = "DONE"
-    elif updated:
-        status = "PARTIAL"
-    else:
-        status = "FAILED"
+    status  = "DONE" if not errors else ("PARTIAL" if updated else "FAILED")
 
     logger.info(
         "◀ Готово [%s]: %s → %d подзадач, статус=%s, ошибок=%d",
@@ -284,6 +392,59 @@ def sync_fields_to_subtasks(
     )
     return _result(parent_key, parent_fields, subtasks, updated, errors, status)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Синхронизация: источник → блокирующие задачи (кросс-очередная)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sync_fields_to_blockers(source_key: str, field_keys: list[str]) -> dict:
+    """
+    Скопировать поля эпика-источника во все блокирующие эпики.
+
+    Используется для кросс-очередной передачи:
+      ENGINEERINGTEAM-epic → BACKENDTEAM-epic (через связь "depends" outward).
+
+    Читает значения полей с API-ключами очереди источника (ENGINEERINGTEAM).
+    Пишет значения с API-ключами очереди получателя (BACKENDTEAM).
+    Каждый вызов patch_issue сам подставляет правильный ID для своей очереди.
+
+    Args:
+        source_key: ключ задачи-источника (напр. "ENGINEERINGTEAM-3701")
+        field_keys: поля для синхронизации ["tags", "businessPriority"]
+
+    Returns:
+        стандартный словарь результата (аналогично sync_fields_to_subtasks)
+    """
+    logger.info("▶ Кросс-очередная синхронизация [%s] → блокирующие задачи", source_key)
+
+    source_fields = get_issue_fields(source_key, field_keys)
+    logger.info("Значения источника [%s]: %s", source_key, source_fields)
+
+    fields_to_sync = {k: v for k, v in source_fields.items() if v is not None}
+    if not fields_to_sync:
+        logger.warning("Все поля %s у %s пусты — пропускаем", field_keys, source_key)
+        return _result(source_key, source_fields, [], [], [], "SKIPPED")
+
+    blockers = get_blocker_issues(source_key)
+    if not blockers:
+        logger.info("У %s нет блокирующих задач — пропускаем", source_key)
+        return _result(source_key, source_fields, [], [], [], "SKIPPED")
+
+    patch_result = patch_issues_parallel(blockers, fields_to_sync)
+    updated = patch_result["updated"]
+    errors  = patch_result["errors"]
+    status  = "DONE" if not errors else ("PARTIAL" if updated else "FAILED")
+
+    logger.info(
+        "◀ Кросс-синхронизация [%s]: %s → %d блокирующих задач, статус=%s",
+        source_key, list(fields_to_sync.keys()), len(blockers), status,
+    )
+    return _result(source_key, source_fields, blockers, updated, errors, status)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Вспомогательная функция результата
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _result(parent, fields, subtasks, updated, errors, status) -> dict:
     return {
@@ -296,9 +457,9 @@ def _result(parent, fields, subtasks, updated, errors, status) -> dict:
     }
 
 
-# ──────────────────────────────────────────────────────────────
-# Публичные обёртки
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Публичные обёртки для webhook_server.py
+# ──────────────────────────────────────────────────────────────────────────────
 
 def sync_tags_to_subtasks(parent_key: str) -> dict:
     """Синхронизировать теги → подзадачи."""
@@ -341,6 +502,56 @@ def sync_all_fields_to_subtasks(parent_key: str) -> dict:
         "tags":             r["fields"].get("tags") or [],
         "businessPriority": r["fields"].get("businessPriority"),
         "subtasks":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }
+
+
+def sync_tags_to_blockers(source_key: str) -> dict:
+    """
+    Синхронизировать ТОЛЬКО теги ENG-эпика → блокирующие BACKEND-эпики.
+    Триггер: поле tags изменилось на эпике очереди Engineering.
+    """
+    r = sync_fields_to_blockers(source_key, ["tags"])
+    return {
+        "source":   r["parent"],
+        "tags":     r["fields"].get("tags") or [],
+        "blockers": r["subtasks"],
+        "updated":  r["updated"],
+        "errors":   r["errors"],
+        "status":   r["status"],
+    }
+
+
+def sync_business_priority_to_blockers(source_key: str) -> dict:
+    """
+    Синхронизировать ТОЛЬКО businessPriority ENG-эпика → блокирующие BACKEND-эпики.
+    Триггер: поле businessPriority изменилось на эпике очереди Engineering.
+
+    Чтение:  ENGINEERINGTEAM → 66af8412375a31188f658397--businessPriority
+    Запись:  BACKENDTEAM     → 66af837b466cdf786c0e0ee6--businessPriority
+    """
+    r = sync_fields_to_blockers(source_key, ["businessPriority"])
+    return {
+        "source":           r["parent"],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "blockers":         r["subtasks"],
+        "updated":          r["updated"],
+        "errors":           r["errors"],
+        "status":           r["status"],
+    }
+
+
+def sync_all_fields_to_blockers(source_key: str) -> dict:
+    """Синхронизировать tags + businessPriority из source_key во все блокирующие задачи."""
+    logger.info("▶ Полная кросс-синхронизация [tags + businessPriority]: %s", source_key)
+    r = sync_fields_to_blockers(source_key, ["tags", "businessPriority"])
+    return {
+        "source":           r["parent"],
+        "tags":             r["fields"].get("tags") or [],
+        "businessPriority": r["fields"].get("businessPriority"),
+        "blockers":         r["subtasks"],
         "updated":          r["updated"],
         "errors":           r["errors"],
         "status":           r["status"],

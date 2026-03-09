@@ -15,6 +15,30 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 
 TRACKER_QUEUE_KEY = os.getenv("TRACKER_QUEUE_KEY", "")
 
+# ──────────────────────────────────────────────────────────────
+# Фильтрация очередей для кросс-очередной синхронизации (blockers)
+# Список префиксов через запятую: "BACKENDTEAM,INFRA,PLATFORM"
+# Пустая строка = разрешены ВСЕ очереди (без фильтра)
+# ──────────────────────────────────────────────────────────────
+BLOCKER_ALLOWED_QUEUES_RAW = os.getenv("BLOCKER_ALLOWED_QUEUES", "BACKENDTEAM")
+
+BLOCKER_ALLOWED_QUEUES: list[str] = [
+    q.strip().upper()
+    for q in BLOCKER_ALLOWED_QUEUES_RAW.split(",")
+    if q.strip()
+]
+
+# ──────────────────────────────────────────────────────────────
+# Отладочные флаги
+# ──────────────────────────────────────────────────────────────
+
+# DRY_RUN=true — читает данные, логирует, но НЕ делает PATCH-запросы
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
+
+# LOG_LINKS_RAW=true — логирует полный JSON всех связей задачи
+LOG_LINKS_RAW: bool = os.getenv("LOG_LINKS_RAW", "false").lower() == "true"
+
+
 
 def get_headers() -> dict:
     """HTTP-заголовки для авторизации в Яндекс Трекер API."""
