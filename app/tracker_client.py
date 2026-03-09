@@ -41,6 +41,37 @@ def _api_key(field_key: str) -> str:
     """
     return LOCAL_FIELDS.get(field_key, field_key)
 
+# ──────────────────────────────────────────────────────────────
+# Вспомогательная функция фильтрации по очереди
+# ──────────────────────────────────────────────────────────────
+
+def _get_queue_key(issue_key: str) -> str:
+    """Извлечь префикс очереди из ключа задачи. 'BACKENDTEAM-42' → 'BACKENDTEAM'"""
+    return issue_key.split("-")[0].upper()
+
+
+def _is_queue_allowed(issue_key: str) -> bool:
+    """
+    Проверить, разрешена ли очередь задачи для кросс-синхронизации.
+
+    Если config.BLOCKER_ALLOWED_QUEUES пуст — разрешены все очереди.
+    Иначе — только те очереди, чей префикс есть в списке.
+
+    Examples:
+        'BACKENDTEAM-7'  → True   (если BLOCKER_ALLOWED_QUEUES=['BACKENDTEAM'])
+        'INFRA-3'        → False  (если BACKENDTEAM не включает INFRA)
+        'BACKENDTEAM-7'  → True   (если BLOCKER_ALLOWED_QUEUES=[] — всё разрешено)
+    """
+    if not config.BLOCKER_ALLOWED_QUEUES:
+        return True
+    queue = _get_queue_key(issue_key)
+    allowed = queue in config.BLOCKER_ALLOWED_QUEUES
+    if not allowed:
+        logger.debug(
+            "Очередь '%s' не в BLOCKER_ALLOWED_QUEUES=%s — пропускаем",
+            queue, config.BLOCKER_ALLOWED_QUEUES,
+        )
+    return allowed
 
 # ──────────────────────────────────────────────────────────────
 
@@ -174,13 +205,17 @@ def patch_issue(issue_key: str, fields: dict) -> dict:
     """
     PATCH /v3/issues/{issue_key}
 
-    Короткие ключи локальных полей автоматически подменяются на полные ID.
-
-    Args:
-        issue_key: ключ задачи
-        fields:    {"tags": [...], "businessPriority": 900}
+    В режиме DRY_RUN=true логирует payload, но НЕ отправляет запрос.
     """
     payload = {_api_key(k): v for k, v in fields.items()}
+
+    if config.DRY_RUN:
+        logger.info(
+            "DRY_RUN: PATCH [%s] НЕ выполнен, payload=%s",
+            issue_key, payload,
+        )
+        return {"key": issue_key, "dry_run": True}
+
     logger.debug("PATCH [%s] payload=%s", issue_key, payload)
     return _request("PATCH", f"/issues/{issue_key}", json=payload)
 
@@ -201,6 +236,12 @@ def patch_issues_parallel(
           "errors":  list[dict],  # [{"issue": key, "error": str}, ...]
         }
     """
+    mode = "DRY_RUN" if config.DRY_RUN else "LIVE"
+    logger.info(
+        "PATCH ×%d (workers=%d, mode=%s): поля %s",
+        len(issue_keys), max_workers, mode, list(fields.keys()),
+    )
+    
     updated: list[str] = []
     errors:  list[dict] = []
 
@@ -345,3 +386,49 @@ def sync_all_fields_to_subtasks(parent_key: str) -> dict:
         "errors":           r["errors"],
         "status":           r["status"],
     }
+
+# ──────────────────────────────────────────────────────────────
+# Получение блокирующих очередей
+# ──────────────────────────────────────────────────────────────
+
+def get_blocker_issues(issue_key: str) -> list[str]:
+    """
+    GET /v3/issues/{issue_key}/links
+
+    Ищет задачи, которые БЛОКИРУЮТ issue_key (т.е. issue_key зависит от них).
+
+    Реальная структура ответа Трекера (проверено на ENGINEERINGTEAM-3701):
+      type.id   = "depends"   — тип связи «зависимость»
+      direction = "outward"   — «текущая задача ЗАВИСИТ ОТ объекта»
+                                = объект является блокером текущей задачи
+    """
+    links = _request("GET", f"/issues/{issue_key}/links")
+
+    if config.LOG_LINKS_RAW:
+        logger.debug("RAW links [%s]: %s", issue_key, links)
+
+    all_blockers = [
+        lnk["object"]["key"]
+        for lnk in links
+        if (
+            lnk.get("type", {}).get("id") == "depends"  
+            and lnk.get("direction") == "outward"       
+            and lnk.get("object", {}).get("key")
+        )
+    ]
+
+    # Фильтрация по разрешённым очередям
+    allowed_blockers = [k for k in all_blockers if _is_queue_allowed(k)]
+    skipped = set(all_blockers) - set(allowed_blockers)
+
+    if skipped:
+        logger.warning(
+            "Блокирующие задачи пропущены (очередь не в BLOCKER_ALLOWED_QUEUES=%s): %s",
+            config.BLOCKER_ALLOWED_QUEUES, sorted(skipped),
+        )
+
+    logger.info(
+        "Блокирующие задачи [%s]: всего=%d, разрешено=%d → %s",
+        issue_key, len(all_blockers), len(allowed_blockers), allowed_blockers,
+    )
+    return allowed_blockers

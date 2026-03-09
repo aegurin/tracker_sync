@@ -56,7 +56,7 @@ _COLORS = {
 class _ColorFormatter(logging.Formatter):
     """Форматтер с ANSI-цветами для консоли."""
 
-    FMT = "{color}{bold}{levelname:<8}{reset} {dim}{asctime}{reset}  " \
+    FMT = "{color}{bold}{levelname:<8}{rseset} {dim}{asctime}{reset}  " \
           "{bold}{name}{reset}  {message}"
 
     def format(self, record: logging.LogRecord) -> str:
