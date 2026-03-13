@@ -8,7 +8,6 @@
     python sync_all.py --queue MYPROJECT
     python sync_all.py --queue MYPROJECT --dry-run
     python sync_all.py --queue MYPROJECT --type epic
-    python sync_all.py --queue MYPROJECT --type epic --type story
     python sync_all.py --queue MYPROJECT --type task --type bug
 """
 import argparse
