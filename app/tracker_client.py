@@ -24,25 +24,6 @@ logger = get_logger(__name__)
 
 PATCH_MAX_WORKERS = 5  # параллельных PATCH-запросов
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Per-queue маппинг локальных полей: очередь → { короткий_ключ → API_ID }
-#
-# Одно и то же поле "businessPriority" имеет разные ID в разных очередях.
-# Чтобы добавить новую очередь:
-#   "NEWQUEUE": {"businessPriority": "xxxxxxxxxxxxxxxxxxxxxxxx--businessPriority"}
-#
-# Получить ID: GET /v3/queues/{QUEUE}/localFields → поле "id"
-# ──────────────────────────────────────────────────────────────────────────────
-
-QUEUE_LOCAL_FIELDS: dict[str, dict[str, str]] = {
-    "BACKENDTEAM": {
-        "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
-    },
-    "ENGINEERINGTEAM": {
-        "businessPriority": "66af8412375a31188f658397--businessPriority",
-    },
-}
-
 
 def _queue_of(issue_key: str) -> str:
     """'ENGINEERINGTEAM-3701' → 'ENGINEERINGTEAM'"""
@@ -62,13 +43,13 @@ def _api_key(field_key: str, issue_key: str) -> str:
         _api_key("businessPriority", "ENGINEERINGTEAM-3701") → "66af8412...--businessPriority"
     """
     queue = _queue_of(issue_key)
-    return QUEUE_LOCAL_FIELDS.get(queue, {}).get(field_key, field_key)
+    return config.QUEUE_LOCAL_FIELDS.get(queue, {}).get(field_key, field_key)
 
 
 def _has_local_fields(field_keys: list[str], issue_key: str) -> bool:
     """Есть ли среди запрошенных полей хотя бы одно локальное для данной очереди?"""
     queue = _queue_of(issue_key)
-    queue_fields = QUEUE_LOCAL_FIELDS.get(queue, {})
+    queue_fields = config.QUEUE_LOCAL_FIELDS.get(queue, {})
     return any(k in queue_fields for k in field_keys)
 
 

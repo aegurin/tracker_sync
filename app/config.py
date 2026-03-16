@@ -29,6 +29,19 @@ BLOCKER_ALLOWED_QUEUES: list[str] = [
 ]
 
 # ──────────────────────────────────────────────────────────────
+# Per-queue маппинг локальных полей: очередь → { короткий_ключ → API_ID }
+# Получить ID: GET /v3/queues/{QUEUE}/localFields → поле "id"
+# ──────────────────────────────────────────────────────────────
+QUEUE_LOCAL_FIELDS: dict[str, dict[str, str]] = {
+    "BACKENDTEAM": {
+        "businessPriority": "66af837b466cdf786c0e0ee6--businessPriority",
+    },
+    "ENGINEERINGTEAM": {
+        "businessPriority": "66af8412375a31188f658397--businessPriority",
+    },
+}
+
+# ──────────────────────────────────────────────────────────────
 # Отладочные флаги
 # ──────────────────────────────────────────────────────────────
 

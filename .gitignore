@@ -9,5 +9,7 @@ app/*/
 !app/*.md
 !app/*.env.example
 
+app/.env
+
 !.gitignore
 !README.md
