@@ -136,7 +136,8 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
     Корректно строит ?fields= с учётом очереди задачи:
       - Если среди field_keys есть локальные поля → передаём ?fields=
         со ВСЕМИ запрошенными ключами (и системными и локальными)
-      - Если только системные → не передаём ?fields= (дефолтный ответ)
+      - Если только системные → обычно дефолтный ответ; если среди них есть tags,
+        явно передаём ?fields=… — иначе пустые теги часто отсутствуют в JSON.
 
     Локальные поля читаются по полному ID (очередь-специфичному),
     возвращаются под коротким ключом.
@@ -155,14 +156,23 @@ def get_issue_fields(issue_key: str, field_keys: list[str]) -> dict:
         issue = get_issue(issue_key, api_keys=api_keys_to_request)
         logger.debug("GET [%s] ?fields=%s", issue_key, ",".join(api_keys_to_request))
     else:
-        # Только системные поля — дефолтный ответ содержит их все
-        issue = get_issue(issue_key)
-        logger.debug("GET [%s] (default fields)", issue_key)
+        # Без ?fields= Трекер нередко не кладёт ключ tags, если тегов нет
+        # (как в логе: «Поле tags не найдено» → None → старый SKIPPED).
+        if "tags" in field_keys:
+            api_keys_to_request = [_api_key(k, issue_key) for k in field_keys]
+            issue = get_issue(issue_key, api_keys=api_keys_to_request)
+            logger.debug("GET [%s] ?fields=%s", issue_key, ",".join(api_keys_to_request))
+        else:
+            issue = get_issue(issue_key)
+            logger.debug("GET [%s] (default fields)", issue_key)
 
     result = {}
     for key in field_keys:
         a_key = _api_key(key, issue_key)
         value = issue.get(a_key)
+        # Пустые теги: ключ может отсутствовать в JSON → [] для единообразия с PATCH
+        if key == "tags" and value is None:
+            value = []
         result[key] = value
         if value is None:
             similar = [k for k in issue if key.lower() in k.lower()]
@@ -328,6 +338,31 @@ def patch_issues_parallel(
 # Синхронизация: родитель → подзадачи
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+def _fields_to_sync_from_parent(parent_fields: dict, field_keys: list[str]) -> dict:
+    """
+    Собрать payload для PATCH дочерних/блокирующих задач по значениям источника.
+
+    Важно для тегов: после очистки поля в UI Трекер в GET часто приходит tags=null
+    или поле отсутствует. Раньше такие значения отбрасывались (if v is not None),
+    из‑за чего fields_to_sync оказывался пустым и синхронизация шла в SKIPPED —
+    подзадачи сохраняли старые теги. None для tags трактуем как [].
+    """
+    out: dict = {}
+    for k in field_keys:
+        v = parent_fields.get(k)
+        if k == "tags":
+            if v is None:
+                out[k] = []
+            elif isinstance(v, list):
+                out[k] = v
+            else:
+                out[k] = [v] if v else []
+        elif v is not None:
+            out[k] = v
+    return out
+
+
 def sync_fields_to_subtasks(parent_key: str, field_keys: list[str]) -> dict:
     """
     Скопировать поля родительской задачи во все прямые подзадачи.
@@ -352,7 +387,7 @@ def sync_fields_to_subtasks(parent_key: str, field_keys: list[str]) -> dict:
     parent_fields = get_issue_fields(parent_key, field_keys)
     logger.info("Значения [%s]: %s", parent_key, parent_fields)
 
-    fields_to_sync = {k: v for k, v in parent_fields.items() if v is not None}
+    fields_to_sync = _fields_to_sync_from_parent(parent_fields, field_keys)
     if not fields_to_sync:
         logger.warning("Все поля %s у %s пусты — пропускаем", field_keys, parent_key)
         return _result(parent_key, parent_fields, [], [], [], "SKIPPED")
@@ -401,7 +436,7 @@ def sync_fields_to_blockers(source_key: str, field_keys: list[str]) -> dict:
     source_fields = get_issue_fields(source_key, field_keys)
     logger.info("Значения источника [%s]: %s", source_key, source_fields)
 
-    fields_to_sync = {k: v for k, v in source_fields.items() if v is not None}
+    fields_to_sync = _fields_to_sync_from_parent(source_fields, field_keys)
     if not fields_to_sync:
         logger.warning("Все поля %s у %s пусты — пропускаем", field_keys, source_key)
         return _result(source_key, source_fields, [], [], [], "SKIPPED")
